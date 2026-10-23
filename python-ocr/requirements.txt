@@ -1,0 +1,11 @@
+# PP-OCRv6 坐标 OCR + 结构目录 + 可选文字层写入
+# 先装推理引擎（CPU 示例）：
+#   python -m pip install paddlepaddle==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+paddleocr>=3.7.0,<4
+Pillow>=10.0.0
+# 写入不可见文字层（AGPL-3.0：闭源商用请改用 OCRmyPDF 方案）
+pymupdf>=1.24.0,<2
+
+# 可选快速落地（另需 Ghostscript）：
+# ocrmypdf>=17
+# ocrmypdf-paddleocr-plus

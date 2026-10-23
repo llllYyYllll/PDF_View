@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+src-tauri/target/
+
+# Logs / OS
+*.log
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+
+# Env
+.env
+.env.*
+
+# Python
+python-ocr/__pycache__/
+python-ocr/tessdata/*.traineddata
+*.pyc
+.venv/
