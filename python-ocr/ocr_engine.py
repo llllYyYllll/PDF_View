@@ -27,18 +27,107 @@ from typing import Any
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "bos")
 
+
+def _clear_stale_proxies() -> None:
+    """清除失效本地代理（如 Clash 7897 已关但仍残留）。
+
+    Windows 还会从注册表读系统代理；仅清环境变量不够，需屏蔽 urllib/requests 的代理发现。
+    """
+    for key in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "SOCKS_PROXY",
+        "socks_proxy",
+        "SOCKS5_PROXY",
+        "socks5_proxy",
+    ):
+        os.environ.pop(key, None)
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+    # 阻止 urllib 读取环境/注册表代理（requests 也走这里）
+    try:
+        urllib.request.getproxies = lambda: {}  # type: ignore[assignment]
+        if hasattr(urllib.request, "getproxies_environment"):
+            urllib.request.getproxies_environment = lambda: {}  # type: ignore[attr-defined]
+        if hasattr(urllib.request, "getproxies_registry"):
+            urllib.request.getproxies_registry = lambda: {}  # type: ignore[attr-defined]
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        urllib.request.install_opener(opener)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_clear_stale_proxies()
+
+def emit_progress(done: int, total: int, stage: str = "") -> None:
+    """写到 stderr，供 Rust 侧解析并转发给前端进度条。"""
+    payload = json.dumps(
+        {"done": int(done), "total": int(total), "stage": stage or ""},
+        ensure_ascii=False,
+    )
+    sys.stderr.write(f"__OCR_PROGRESS__{payload}\n")
+    sys.stderr.flush()
+
+
 # 懒加载单例，避免每次请求重新下模型
 _OCR = None
 _OCR_TIER: str | None = None
+_OCR_DEVICE: str | None = None
 _STRUCTURE = None
+_STRUCTURE_DEVICE: str | None = None
+# 进程内缓存：首次探测后复用
+_DETECTED_DEVICE: str | None = None
+_DETECTED_GPU: bool | None = None
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-# 可本地缓存检测的档位（medium 走 PaddleOCR 默认名，不在此表）
+# 各档位检测/识别模型名（用于本地缓存检测与显式加载）
 _TIER_MODELS: dict[str, tuple[str, str]] = {
     "tiny": ("PP-OCRv6_tiny_det", "PP-OCRv6_tiny_rec"),
     "small": ("PP-OCRv6_small_det", "PP-OCRv6_small_rec"),
+    "medium": ("PP-OCRv6_medium_det", "PP-OCRv6_medium_rec"),
 }
+
+
+def detect_inference_device() -> tuple[str, bool]:
+    """探测本机是否可用 GPU；有则返回 (gpu:0, True)，否则 (cpu, False)。"""
+    global _DETECTED_DEVICE, _DETECTED_GPU
+    if _DETECTED_DEVICE is not None and _DETECTED_GPU is not None:
+        return _DETECTED_DEVICE, _DETECTED_GPU
+
+    device = "cpu"
+    gpu = False
+    try:
+        import paddle
+
+        compiled = False
+        try:
+            compiled = bool(paddle.device.is_compiled_with_cuda())
+        except Exception:  # noqa: BLE001
+            compiled = False
+        count = 0
+        if compiled:
+            try:
+                count = int(paddle.device.cuda.device_count())
+            except Exception:  # noqa: BLE001
+                count = 0
+        if compiled and count > 0:
+            device = "gpu:0"
+            gpu = True
+    except Exception:  # noqa: BLE001
+        pass
+
+    _DETECTED_DEVICE = device
+    _DETECTED_GPU = gpu
+    return device, gpu
+
+
+def get_inference_device() -> str:
+    return detect_inference_device()[0]
 
 
 class _StdoutToStderr:
@@ -91,34 +180,54 @@ def _model_ready(name: str) -> bool:
 
 
 def _resolve_tier(requested: str) -> str:
-    """优先用请求档位；若本地无模型则回退到已缓存档位，避免无网时硬失败。"""
+    """规范化档位名。本地无模型时仍返回请求档，由 get_ocr 先尝试下载，失败再回退。"""
     req = (requested or "small").lower()
-    if req == "medium":
-        return "medium"
     if req not in _TIER_MODELS:
-        req = "small"
-    det, rec = _TIER_MODELS[req]
-    if _model_ready(det) and _model_ready(rec):
-        return req
+        return "small"
+    return req
+
+def _cached_fallback_tier(preferred: str) -> str | None:
+    """在 preferred 不可用时，返回本机已缓存的 small/tiny。"""
     for fallback in ("small", "tiny"):
-        if fallback == req:
+        if fallback == preferred:
             continue
         d, r = _TIER_MODELS[fallback]
         if _model_ready(d) and _model_ready(r):
             return fallback
-    return req
+    return None
+
+
+def _bos_reachable(timeout: float = 4.0) -> bool:
+    """快速探测百度 BOS 是否可达（代理失效时会马上失败）。"""
+    url = "https://paddle-model-ecology.bj.bcebos.com/"
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= getattr(resp, "status", 200) < 500
+    except Exception:  # noqa: BLE001
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return 200 <= getattr(resp, "status", 200) < 500
+        except Exception:  # noqa: BLE001
+            return False
 
 
 def _tier_kwargs(tier: str) -> dict[str, Any]:
+    device = get_inference_device()
     kwargs: dict[str, Any] = {
         "use_doc_orientation_classify": False,
         "use_doc_unwarping": False,
         "use_textline_orientation": False,
+        "device": device,
     }
-    if tier == "medium":
-        # 不指定 name 时走 PaddleOCR 默认
+    # GPU 上适当加大识别 batch，CPU 保持 1 更稳
+    if device.startswith("gpu"):
+        kwargs["text_recognition_batch_size"] = 8
+    names = _TIER_MODELS.get(tier)
+    if not names:
         return kwargs
-    det, rec = _TIER_MODELS[tier]
+    det, rec = names
     kwargs["text_detection_model_name"] = det
     kwargs["text_recognition_model_name"] = rec
     if _model_ready(det):
@@ -138,10 +247,25 @@ def decode_image(image_base64: str):
 
 
 def get_ocr(tier: str = "small"):
-    """PP-OCRv6：tiny / small / medium。有本地缓存则直读，否则经 BOS 下载。"""
-    global _OCR, _OCR_TIER
+    """PP-OCRv6：tiny / small / medium。有本地缓存则直读，否则经 BOS 下载。自动选 GPU/CPU。"""
+    global _OCR, _OCR_TIER, _OCR_DEVICE, _DETECTED_DEVICE, _DETECTED_GPU
     resolved = _resolve_tier(tier)
-    if _OCR is not None and _OCR_TIER == resolved:
+    det, rec = _TIER_MODELS[resolved]
+    if not (_model_ready(det) and _model_ready(rec)):
+        cached = _cached_fallback_tier(resolved)
+        # 网络不通时不要进入 Paddle 多源重试（可卡数分钟）；有缓存则立刻回退
+        if cached and not _bos_reachable():
+            sys.stderr.write(
+                f"[ocr] 本地无 {resolved} 且无法连接模型源，改用已缓存 {cached}\n"
+            )
+            resolved = cached
+        elif not cached:
+            sys.stderr.write(
+                f"[ocr] 本地无 {resolved}，将尝试从 BOS 下载…\n"
+            )
+
+    device = get_inference_device()
+    if _OCR is not None and _OCR_TIER == resolved and _OCR_DEVICE == device:
         return _OCR
     try:
         from paddleocr import PaddleOCR
@@ -149,33 +273,77 @@ def get_ocr(tier: str = "small"):
         raise RuntimeError(
             "未安装 PaddleOCR。请执行：\n"
             "  python -m pip install paddlepaddle==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/\n"
+            "  # 若有 NVIDIA GPU，请改为安装对应 CUDA 版 paddlepaddle\n"
             "  pip install -r python-ocr/requirements.txt"
         ) from exc
 
-    kwargs = _tier_kwargs(resolved)
-    try:
+    def _try_create(tier_name: str, device_name: str) -> Any:
+        kw = _tier_kwargs(tier_name)
+        kw["device"] = device_name
+        if not device_name.startswith("gpu"):
+            kw.pop("text_recognition_batch_size", None)
         with _StdoutToStderr():
-            _OCR = PaddleOCR(**kwargs)
-            _OCR_TIER = resolved
+            return PaddleOCR(**kw)
+
+    try:
+        _OCR = _try_create(resolved, device)
+        _OCR_TIER = resolved
+        _OCR_DEVICE = device
     except Exception as exc:  # noqa: BLE001
         msg = _strip_ansi(str(exc))
+        # GPU 初始化失败 → CPU
+        if device.startswith("gpu"):
+            try:
+                _OCR = _try_create(resolved, "cpu")
+                _OCR_TIER = resolved
+                _OCR_DEVICE = "cpu"
+                _DETECTED_DEVICE = "cpu"
+                _DETECTED_GPU = False
+                return _OCR
+            except Exception as cpu_exc:  # noqa: BLE001
+                msg = _strip_ansi(str(cpu_exc))
+
+        # 下载失败 / 模型缺失 → 回退已缓存档位（你本机已有 small/tiny）
+        fallback = _cached_fallback_tier(resolved)
+        if fallback:
+            try:
+                sys.stderr.write(
+                    f"[ocr] 加载 {resolved} 失败，回退到本地 {fallback}\n"
+                )
+                use_dev = "cpu" if device.startswith("gpu") else device
+                _OCR = _try_create(fallback, use_dev)
+                _OCR_TIER = fallback
+                _OCR_DEVICE = use_dev
+                return _OCR
+            except Exception:  # noqa: BLE001
+                pass
+
         local = _models_root()
+        proxy_hint = ""
+        if "ProxyError" in msg or "7897" in msg or "proxy" in msg.lower():
+            proxy_hint = (
+                "\n5) 检测到代理连接失败（如 localhost:7897）。"
+                "请关闭失效代理，或清除系统/终端里的 HTTP(S)_PROXY 后再试。"
+            )
         raise RuntimeError(
-            f"无法加载 PP-OCRv6（档位 {resolved}）。\n"
+            f"无法加载 PP-OCRv6（档位 {resolved}，设备 {device}）。\n"
             f"原因: {msg}\n"
             f"本地模型目录: {local}\n"
             "处理建议：\n"
             "1) 有网时再试一次（会从百度 BOS 下载模型）；\n"
-            "2) 或先用已缓存的 tiny/small 模型；\n"
-            "3) 确认已设置 PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True。"
+            "2) 设置里先改用已缓存的 tiny/small 档位；\n"
+            "3) 有 GPU 但失败时请确认已安装 CUDA 版 paddlepaddle；\n"
+            "4) 确认已设置 PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True。"
+            f"{proxy_hint}"
         ) from exc
     return _OCR
 
 
 def get_structure():
-    global _STRUCTURE
-    if _STRUCTURE is not None:
-        return _STRUCTURE
+    global _STRUCTURE, _STRUCTURE_DEVICE
+    device = get_inference_device()
+    if _STRUCTURE is not None and _STRUCTURE_DEVICE == device:
+        return _STRUCTURE if _STRUCTURE else None
     try:
         from paddleocr import PPStructureV3
     except ImportError:
@@ -184,9 +352,24 @@ def get_structure():
         _STRUCTURE = PPStructureV3(
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
+            device=device,
         )
+        _STRUCTURE_DEVICE = device
     except Exception:  # noqa: BLE001
-        _STRUCTURE = False  # 标记不可用
+        if device.startswith("gpu"):
+            try:
+                _STRUCTURE = PPStructureV3(
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    device="cpu",
+                )
+                _STRUCTURE_DEVICE = "cpu"
+            except Exception:  # noqa: BLE001
+                _STRUCTURE = False
+                _STRUCTURE_DEVICE = device
+        else:
+            _STRUCTURE = False  # 标记不可用
+            _STRUCTURE_DEVICE = device
     return _STRUCTURE if _STRUCTURE else None
 
 
@@ -504,8 +687,11 @@ def ocr_pdf_document(request: dict[str, Any]) -> dict[str, Any]:
     write_layer = bool(request.get("writeTextLayer", True))
     page_offset = int(request.get("pageOffset") or 0)
 
+    emit_progress(0, 0, "loading_model")
     ocr = get_ocr(tier)
     doc = fitz.open(pdf_path)
+    total_pages = len(doc)
+    emit_progress(0, total_pages, "start")
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
 
@@ -514,7 +700,7 @@ def ocr_pdf_document(request: dict[str, Any]) -> dict[str, Any]:
     toc_outlines: list[dict[str, Any]] = []
     page_overlays: list[dict[str, Any]] = []
 
-    for i in range(len(doc)):
+    for i in range(total_pages):
         page = doc[i]
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img_bytes = pix.tobytes("png")
@@ -565,6 +751,9 @@ def ocr_pdf_document(request: dict[str, Any]) -> dict[str, Any]:
                 doc=doc,
             )
 
+        emit_progress(i + 1, total_pages, "page")
+
+    emit_progress(total_pages, total_pages, "saving")
     outline = merge_outlines(
         build_outline_from_titles(structure_titles),
         toc_outlines,
@@ -575,10 +764,13 @@ def ocr_pdf_document(request: dict[str, Any]) -> dict[str, Any]:
 
     doc.save(out_path, garbage=4, deflate=True)
     doc.close()
+    emit_progress(total_pages, total_pages, "done")
 
     return {
         "mode": "offline",
         "engine": "PP-OCRv6",
+        "tier": _OCR_TIER or _resolve_tier(tier),
+        "device": _OCR_DEVICE or get_inference_device(),
         "outputPath": out_path,
         "outline": outline,
         "pages": page_overlays,
@@ -632,6 +824,8 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
         )
 
     result = offline_ocr_image(image_base64, tier=tier)
+    result["device"] = _OCR_DEVICE or get_inference_device()
+    result["tier"] = _OCR_TIER or _resolve_tier(tier)
     # 单页也可附带结构标题，供前端生成目录
     try:
         titles = extract_titles_structure(decode_image(image_base64))
@@ -642,13 +836,39 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def probe_backends() -> dict[str, Any]:
+    """供 Rust detect_ocr_backends 调用：探测 PaddleOCR 与 GPU。"""
+    paddle_ok = False
+    engine = "none"
+    try:
+        from paddleocr import PaddleOCR  # noqa: F401
+
+        paddle_ok = True
+        engine = "PP-OCRv6"
+    except Exception:  # noqa: BLE001
+        pass
+    device, gpu = detect_inference_device()
+    return {
+        "offlineReady": paddle_ok,
+        "onlineReady": True,
+        "engine": engine,
+        "gpuAvailable": gpu,
+        "device": device,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stdin-json", action="store_true")
+    parser.add_argument("--probe", action="store_true", help="探测 OCR 后端与 GPU")
     parser.add_argument("--file", type=str, default="")
     args = parser.parse_args()
 
     try:
+        if args.probe:
+            sys.stdout.write(json.dumps(probe_backends(), ensure_ascii=False))
+            return 0
+
         if args.file:
             with open(args.file, "r", encoding="utf-8") as f:
                 request = json.load(f)

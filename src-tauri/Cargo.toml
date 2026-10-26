@@ -21,3 +21,9 @@ tauri = { version = "2", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
+tauri-plugin-http = "2"
+# AI 请求的直连回退通道：与控制台插件相同的 TLS / HTTP2 特性，
+# 但可以显式关闭系统代理，并返回完整的错误链。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "system-proxy", "stream"] }
+futures-util = "0.3"
+base64 = "0.22"

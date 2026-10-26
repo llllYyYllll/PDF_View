@@ -15,7 +15,15 @@ type Props = {
   ocrOverlays: OcrPageOverlay[]
   highlightColor: string
   onPageChange: (pageIndex: number, scrollRatio: number) => void
-  onAddHighlight: (pageIndex: number, text: string, rects: Highlight['rects']) => void
+  onTextSelected: (
+    pageIndex: number,
+    text: string,
+    rects: Highlight['rects'],
+    clientX: number,
+    clientY: number,
+  ) => void
+  onUpdateHighlightNote: (id: string, note: string) => void
+  onRemoveHighlight: (id: string) => void
 }
 
 const CACHE_SIZE = 10
@@ -30,7 +38,9 @@ export function Viewer({
   ocrOverlays,
   highlightColor,
   onPageChange,
-  onAddHighlight,
+  onTextSelected,
+  onUpdateHighlightNote,
+  onRemoveHighlight,
 }: Props) {
   const scrollerRef = useRef<HTMLDivElement>(null)
   const [geoms, setGeoms] = useState<PageGeom[]>([])
@@ -193,7 +203,9 @@ export function Viewer({
               highlights={highlightsByPage.get(i) || []}
               ocrOverlay={ocrMap.get(i)}
               highlightColor={highlightColor}
-              onAddHighlight={onAddHighlight}
+              onTextSelected={onTextSelected}
+              onUpdateHighlightNote={onUpdateHighlightNote}
+              onRemoveHighlight={onRemoveHighlight}
             />
           </div>
         ))}
